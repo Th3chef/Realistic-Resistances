@@ -1,0 +1,45 @@
+name: Bug report
+description: Fire, gas or arc resistance doesn't work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the report! Please attach the log (RealisticResistances.log in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs). It lists your options, the armor passive and weight it found, and what it did.
+  - type: input
+    id: version
+    attributes:
+      label: Mod version
+      placeholder: 0.5.0
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and armor
+      description: Which choices you picked for Fire, Gas and Arc Resistance, and the armor (passive and weight) you wore.
+      placeholder: "All options on both parts; Acclimated, medium armor."
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game version / date of the last game update
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected and what happened instead (what set you on fire, gassed or shocked you). Solo, hosting or joining someone else's game?
+    validations:
+      required: true
+  - type: textarea
+    id: mods
+    attributes:
+      label: Other mods
+      description: Other mods that change armor passives or status effects, and your mod manager.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: Drag RealisticResistances.log here.
