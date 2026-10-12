@@ -7,7 +7,8 @@
 --   Gas Resistance: gas builds up slower, by the armor's gas resistance, and wears off
 --   sooner once you are out. No Gas Slow: with 80% or more the gas's stumbling/slowing never takes hold.
 --   Arc Resistance: the same for the electric effect, by the armor's arc resistance, and arc-resistant passives
---   take a quarter of the arc damage they did, and the stun from an arc hit is shorter by the same resistance. Grounded (Electrical Conduit): arcs end at you instead of chaining on.
+--   take a quarter of the arc damage they did, and the stun from an arc hit is shorter by the same resistance; an EMS stun wears off sooner by it too (Electrical Conduit
+--   is never stunned by EMS). Grounded (Electrical Conduit): arcs end at you instead of chaining on.
 -- In the mod manager each resistance is an option with sub-options (both parts / only one); with CowboyBingus's
 -- Mod Options Menu installed the same three choices are in the game's MODS tab and change at once.
 -- Only your own helldiver is changed. The damage itself is left to the game (the passive already reduces it).
@@ -17,7 +18,7 @@
 
 local bit = require('bit')
 local ffi = require('ffi')
-local VERSION = '0.1.0 Test 13'
+local VERSION = '0.5.1 Test 1'
 local TESTER = true       -- tester logging (extra detail in the log); off in the release
 local TEST_LOGS = true    -- numbered test builds log to Logs\test; releases and the release Tester to Logs
 local LOG_NAME = 'RealisticResistances.log'
@@ -58,19 +59,48 @@ local KINDS = {
 local KIND_OF = {}
 for kind, def in pairs(KINDS) do for id in pairs(def.ids) do KIND_OF[id] = kind end end
 local HOLD = { [5] = 3.0, [42] = 0.5, [43] = 0.5, [44] = 0.5, [45] = 0.5 }
+-- ((0.5.1 review) the ids above are the Sept 2026 game's and the game data gives no names to find them by, so each
+-- one is checked the first time it can be against what it is known to do: Fire and Gas take hold at a build-up of
+-- HOLD (3 / 0.5), so one seen well above that before it took hold, or taking hold well below it after a slow, steady
+-- build-up, is another status; Stun Small comes on at once and lasts about 1.5 s. A failed check logs
+-- "status ids moved" once and turns that element's status changes off.)
+local ID_HOLD = { [5] = 3.0, [42] = 0.5, [43] = 0.5, [44] = 0.5, [45] = 0.5 }
+local STUN_LEN = { 0.5, 3.0 }   -- Stun Small's length (s) must be within this the first time it is cut
 local CONFUSION_IDS = { [44] = true, [45] = true }   -- the gas's movement effect (stumbling, slowing)
 -- arc hits stun you: each hit puts on a Stun Small (37) at once (no build-up), 1.5 s in tests. With arc
 -- resistance the stun is cut to its length x the arc damage multiplier, not rounded, so it matches the passive's
 -- percentage: Electrical Conduit (95%) 0.075 s, Adreno-Defibrillator / Acclimated (50%) 0.75 s, Desert Stormer 0.9 s. (The game doesn't say what caused a stun, so while you wear
 -- arc resistance every Stun Small is shortened.)
 local ARC_STUN_IDS = { [37] = true }
+-- EMS (0.5.2): an EMS blast or field puts a Stun Medium (38) on you at once (no build-up). Inside a field the game
+-- puts it on again every frame (its end moves with the clock, ~3 s ahead); once you are out it runs out in ~3 s.
+-- With arc resistance: Electrical Conduit (95%+) is never stunned by EMS (blocked the way No Gas Slow blocks the
+-- gas's stumbling); other arc armor keeps the after-effect x its arc multiplier (50%: 1.5 s, Desert Stormer 1.8 s).
+-- (The game doesn't say what caused a stun, so while you wear arc resistance every Stun Medium is changed.)
+local EMS_IDS = { [38] = true }
+local EMS_IMMUNE = 0.1          -- arc multiplier at or below which (95%+, Electrical Conduit) EMS never takes hold
+local EMS_LEN = { 1.5, 6.0 }    -- Stun Medium's length (s) must be within this the first time it is seen (id check)
 local LOCATE_EVERY = 0.25
-local MAX_LINES = TESTER and 6000 or 300
+local LOCATE_IDLE = 2      -- (wearing no armor the mod works on, or its options are off: only the armor check, every 2 s)
+local WEIGHT_RETRY = 10    -- seconds before an armor weight lookup that failed is tried again
+-- ((0.5.1 review) the log keeps 1000 lines in a tester build and 300 in the release; numbered test builds keep 6000
+-- for their extra lines)
+local MAX_LINES = TESTER and 1000 or 300
+local ALL_STATUSES = false   -- (every status is read, not only the handled ones: numbered test builds)
+--@research-begin
+MAX_LINES, ALL_STATUSES = TESTER and 6000 or 300, TESTER
+--@research-end
 
-if rawget(_G, 'RealisticResistances') then return end
+-- ((0.5.1 review) a copy of the mod already loaded in this Lua state (the mod reloaded without the state being
+-- reset): it is asked to put the game's values back and stop, and this copy takes over once it has (or once it no
+-- longer runs, when the loader reset the hooks: then this copy puts its values back for it). An older copy that
+-- keeps running without handing over (0.5.0) keeps the mod to itself, as before.)
+local PREV = rawget(_G, 'RealisticResistances')
+if type(PREV) ~= 'table' then PREV = nil end
 local S = { status = 'starting', frame = 0, events = {}, dirty = true, stats = { writes = 0, write_failures = 0 } }
-for kind in pairs(KINDS) do S.stats[kind] = { caught = 0, kept = 0, cut = 0, saved = 0, stumble = 0, stun = 0, stun_saved = 0, grounded = 0 } end
+for kind in pairs(KINDS) do S.stats[kind] = { caught = 0, kept = 0, cut = 0, saved = 0, stumble = 0, stun = 0, stun_saved = 0, grounded = 0, ems_blocked = 0, ems_cut = 0, ems_saved = 0 } end
 rawset(_G, 'RealisticResistances', S)
+if PREV then PREV.superseded = true end
 local BOOSTED
 local GRAFTED = {}   -- passive table -> { orig_list, orig_n, list, n }: the mod's own copy of its modifiers + arc
 
@@ -220,10 +250,7 @@ local function rptr(address)
   return p
 end
 
-local function map_lookup(base, key)   -- base: slots ptr at +0, cap +8, empty +12, mult +16
-  local h = peek(base, 20)
-  if not h then return nil end
-  local slots, cap, empty, mult = pu64(h, 0), pu32(h, 8), pu32(h, 12), pu32(h, 16)
+local function map_find(slots, cap, empty, mult, key)
   if slots < 0x10000 or cap == 0 or cap > 1048576 or bit.band(cap, cap - 1) ~= 0 then return nil end
   local mlo = mult % 65536
   local hash = (key * mlo + (key * ((mult - mlo) / 65536) % 65536) * 65536) % 4294967296
@@ -236,8 +263,13 @@ local function map_lookup(base, key)   -- base: slots ptr at +0, cap +8, empty +
   end
   return nil
 end
+local function map_lookup(base, key)   -- base: slots ptr at +0, cap +8, empty +12, mult +16
+  local h = peek(base, 20)
+  if not h then return nil end
+  return map_find(pu64(h, 0), pu32(h, 8), pu32(h, 12), pu32(h, 16), key)
+end
 
---@tester-begin
+--@research-begin
 local function map_all(base, limit)    -- every (key, value) in a map (tester research)
   local h = api.read(base, 20)
   if not h then return {} end
@@ -256,7 +288,7 @@ local function map_all(base, limit)    -- every (key, value) in a map (tester re
   end
   return out
 end
---@tester-end
+--@research-end
 
 -- ---------------------------------------------------------------- log
 -- Release builds log to the Bingus loader's Logs folder; test builds to Logs\test (when it exists)
@@ -284,20 +316,25 @@ local function event(text)
   end
   S.dirty = true
 end
--- errors: each different one is kept (never dropped with old lines), with how many times it happened
+-- errors: each different one is kept (never dropped with old lines), with how many times it happened. Returns true
+-- for an error not seen before (the caller writes the log at once).
+-- ((0.5.1 review) once 20 are kept, further different errors are only counted (shown in the summary) and return
+-- false, so an error that keeps changing can't rewrite the log every frame)
 local function log_error(e)
   e = tostring(e)
   S.errors = S.errors or {}
   local x = S.errors[e]
-  if x then x.n = x.n + 1; return end
-  if #S.errors >= 20 then return end
+  if x then x.n = x.n + 1; return false end
+  if #S.errors >= 20 then S.errors_more = (S.errors_more or 0) + 1; return false end
   S.errors[e] = { n = 1 }
   S.errors[#S.errors + 1] = e
   S.err_logged = true
   event('error: ' .. e)
+  return true
 end
 local function write_log()
   S.dirty = false
+  if S.retired then return end   -- ((0.5.1 review) handed over to a newer copy: the log is the newer copy's now)
   pcall(function()
     LOGDIR = LOGDIR or log_dir()
     if not LOGDIR then return end
@@ -314,14 +351,15 @@ local function write_log()
         st.fire.caught, st.fire.kept, st.fire.cut, st.fire.saved),
       string.format('gas: took hold %d time(s), kept off %d, cut short %d (%.1f s saved); stumbling/slowing blocked %d time(s)',
         st.gas.caught, st.gas.kept, st.gas.cut, st.gas.saved, st.gas.stumble),
-      string.format('arc: took hold %d time(s), kept off %d, cut short %d (%.1f s saved); stuns shortened %d (%.1f s saved); arcs grounded %d',
-        st.arc.caught, st.arc.kept, st.arc.cut, st.arc.saved, st.arc.stun, st.arc.stun_saved, st.arc.grounded),
+      string.format('arc: took hold %d time(s), kept off %d, cut short %d (%.1f s saved); stuns shortened %d (%.1f s saved); arcs grounded %d; EMS blocked %d, cut short %d (%.1f s saved)',
+        st.arc.caught, st.arc.kept, st.arc.cut, st.arc.saved, st.arc.stun, st.arc.stun_saved, st.arc.grounded, st.arc.ems_blocked, st.arc.ems_cut, st.arc.ems_saved),
       string.format('memory writes: %d, write failures %d', st.writes, st.write_failures),
       '', 'events:' } end)
     if not okh then out = { 'Realistic Resistances ' .. VERSION, 'log summary error: ' .. tostring(out), '', 'events:' } end
     if S.errors and #S.errors > 0 then
       table.insert(out, #out - 1, 'errors:')
       for _, e in ipairs(S.errors) do table.insert(out, #out - 1, string.format('  %s (%d time(s))', e, S.errors[e].n)) end
+      if S.errors_more then table.insert(out, #out - 1, string.format('  (%d more error(s) not kept)', S.errors_more)) end
     end
     if S.dropped then out[#out + 1] = string.format('  (%d older line(s) left out)', S.dropped) end
     local f = io.open(LOGDIR .. '\\' .. LOG_NAME, 'wb')
@@ -469,22 +507,38 @@ local function find_player()
   if avatar == 32767 then return nil, 'no helldiver yet' end
   local owner, unit, is_local = owner_of(avatar)
   if not owner or not is_local then return nil, 'no helldiver yet' end   -- (only ever your own helldiver)
-  return { avatar = avatar, owner = owner, unit = unit, is_local = is_local }
+  return { avatar = avatar, owner = owner, unit = unit }
 end
 
 -- arc damage modifiers the mod has boosted: address -> { orig = the game's value, new = the boosted value }
 BOOSTED = {}
+-- ((0.5.1 review) the same by passive and stat, for the whole game session (kept across reloads with the rest, see
+-- KEEP_VAR): passive id -> stat -> { orig, new }. A modifier at an address the mod has not boosted that holds the
+-- passive's known boosted value is the mod's (the game copied it, or an earlier load boosted it): its game value is
+-- the known one, so it is neither taken for the game's value nor boosted again.)
+local KNOWN = {}
 
 -- the passive table(s) an entity's armor uses: entity -> passive map -> record -> slot -> passive table
+-- ((0.6.0 review) the record's armor fields and passive slots sit together: read in one go)
+local function record_row(g, idx)
+  local lo = math.min(L.wtype, L.witem, L.slots[1], L.slots[2])
+  local hi = math.max(L.wtype, L.witem, L.slots[1], L.slots[2]) + 4
+  if hi - lo > 0x100 then return nil end
+  return api.read(g + idx * L.rstride + lo, hi - lo), lo
+end
 local function passive_of(key)
   local g = rptr(L.passives)
   if not g then return nil end
   local idx = map_lookup(g + L.pmap, key)
   if not idx then return nil end
   local found, seen, list = {}, {}, nil
+  local row, lo = record_row(g, idx)
   for _, off in ipairs(L.slots) do
-    local r = api.read(g + idx * L.rstride + off, 4)
-    local a = r and u32(r, 0)
+    local a
+    if row then a = u32(row, off - lo) else
+      local r = api.read(g + idx * L.rstride + off, 4)
+      a = r and u32(r, 0)
+    end
     if a and a ~= 0 and a < 100000 then
       local kr = api.read(g + a * 4 + L.ptable, 4)
       local k = kr and u32(kr, 0)
@@ -493,7 +547,8 @@ local function passive_of(key)
       local head = pp and not seen[pp] and api.read(pp, 32)   -- (the same table in both slots counts once)
       if head then
         seen[pp] = true
-        local stats, n, ml = {}, u32(head, 24), u64(head, 16)
+        local stats, n, ml, pid = {}, u32(head, 24), u64(head, 16), u32(head, 0)
+        local kn = KNOWN[pid]
         local gr = GRAFTED[pp]
         if gr and ml == gr.list then n, ml = gr.orig_n, gr.orig_list end   -- (the game's own modifiers)
         local at = {}
@@ -503,12 +558,14 @@ local function passive_of(key)
           if u32(mods, 16 * i + 4) == 2 then   -- (op 2 = multiplies the damage)
             local addr, stat = ml + 16 * i + 8, u32(mods, 16 * i)
             if not stats[stat] then   -- (the game uses the first modifier of each stat)
-              stats[stat] = BOOSTED[addr] and BOOSTED[addr].orig or f32_at(mods, 16 * i + 8)   -- (the game's own value)
+              local v, b, k = f32_at(mods, 16 * i + 8), BOOSTED[addr], kn and kn[stat]
+              if b then v = b.orig elseif k and v == k.new then v = k.orig end   -- (the game's own value)
+              stats[stat] = v
               at[stat] = addr
             end
           end
         end
-        found[#found + 1] = { id = u32(head, 0), name = u32(head, 4), stats = stats, at = at, pp = pp, ml = ml, n = n }
+        found[#found + 1] = { id = pid, name = u32(head, 4), stats = stats, at = at, pp = pp, ml = ml, n = n }
       end
     end
   end
@@ -518,13 +575,10 @@ end
 -- weight of the body armor (0 light, 1 medium, 2 heavy), the way the game works out its armor rating: the armor
 -- item's pieces of the worn type each carry a level; the rating is their average
 local weight_cache = {}   -- 'kind:item' -> { weight, description }: armor item data doesn't change in a session
-local function armor_weight(g, idx)
-  local kr, ir = idx and api.read(g + idx * L.rstride + L.wtype, 4), idx and api.read(g + idx * L.rstride + L.witem, 4)
-  if not kr or not ir then return nil end
-  local kind, item = u32(kr, 0), u32(ir, 0)
-  local ck = kind .. ':' .. item
-  local c = weight_cache[ck]
-  if c then return c[1], c[2] end
+-- ((0.5.1 review) a lookup that failed is not tried again for WEIGHT_RETRY seconds: 'kind:item' -> when to try again
+-- (it was scanned 4x a second, up to 4096 reads each time))
+local weight_fail = {}
+local function weight_scan(g, kind, item)
   local h = api.read(g, 16)
   local list, n = h and u64(h, 0), h and u32(h, 8)
   if not list or not n or n == 0 or n > 4096 then return nil end
@@ -560,8 +614,26 @@ local function armor_weight(g, idx)
     end
   end
   if count == 0 then return nil end
-  c = { math.floor(sum / count + 0.5), string.format('item %08X type %d, %d piece(s), average level %.2f', item, kind, count, sum / count) }
-  weight_cache[ck] = c
+  return { math.floor(sum / count + 0.5), string.format('item %08X type %d, %d piece(s), average level %.2f', item, kind, count, sum / count) }
+end
+local function armor_weight(g, idx)
+  local row, lo = nil, nil
+  if idx then row, lo = record_row(g, idx) end
+  local kind, item
+  if row then kind, item = u32(row, L.wtype - lo), u32(row, L.witem - lo)
+  else
+    local kr, ir = idx and api.read(g + idx * L.rstride + L.wtype, 4), idx and api.read(g + idx * L.rstride + L.witem, 4)
+    if not kr or not ir then return nil end
+    kind, item = u32(kr, 0), u32(ir, 0)
+  end
+  local ck = kind .. ':' .. item
+  local c = weight_cache[ck]
+  if c then return c[1], c[2] end
+  local now = api.now()
+  if weight_fail[ck] and now < weight_fail[ck] then return nil end
+  c = weight_scan(g, kind, item)
+  if not c then weight_fail[ck] = now + WEIGHT_RETRY; return nil end
+  weight_fail[ck], weight_cache[ck] = nil, c
   return c[1], c[2]
 end
 
@@ -576,7 +648,7 @@ local function link_key(owner)
   return (owner_of(target))
 end
 
---@tester-begin
+--@research-begin
 -- tester research: every entity the passive map knows
 local function passive_map_dump()
   local g = rptr(L.passives)
@@ -633,7 +705,7 @@ local function passive_layout_dump()
     event(string.format('  key %d idx %s: %s', kv[1], tostring(idx), table.concat(parts, ', ')))
   end
 end
---@tester-end
+--@research-end
 
 -- ---------------------------------------------------------------- status entries
 -- times are rounded to the nearest 0.05 s, so they stay easy to read but keep following the resistance
@@ -654,32 +726,52 @@ end
 local HANDLED = {}
 for id in pairs(KIND_OF) do HANDLED[id] = true end
 for id in pairs(ARC_STUN_IDS) do HANDLED[id] = true end
+for id in pairs(EMS_IDS) do HANDLED[id] = true end
 local entries_out, entry_pool = {}, {}   -- (reused every frame: no new tables)
+-- ((0.6.0 review) true on the first frame statuses are read after a gap (start-up, idle, no helldiver): what is on
+-- you then was already there, so a tracker made now must not count it as new, nor id-check a part-run stun)
+local late, last_handled = true, -1
+local last_n = 0   -- (0.6.0 review) statuses last frame: when there were some, the count and entries are read together
 local function status_entries(owner)
   local m = rptr(L.status)
   if not m then return nil end
-  local idx = map_lookup(m + L.smap, owner)
-  if not idx then return nil end
-  local b1 = rptr(m + L.blocks)
-  if not b1 then return nil end
+  -- ((0.6.0 review) the map header and the blocks pointer in one read when they sit close together)
+  local span = L.blocks - L.smap
+  local idx, b1
+  if span >= 20 and span <= 0x100 then
+    local h = peek(m + L.smap, span + 8)
+    if not h then return nil end
+    b1 = pu64(h, span)
+    idx = map_find(pu64(h, 0), pu32(h, 8), pu32(h, 12), pu32(h, 16), owner)
+    if not idx or b1 < 0x10000 or b1 > 0x7FFFFFFFFFFF then return nil end
+  else
+    idx = map_lookup(m + L.smap, owner)
+    if not idx then return nil end
+    b1 = rptr(m + L.blocks)
+    if not b1 then return nil end
+  end
   local block = b1 + idx * L.bstride
-  local h = peek(block + L.bcount, 4)
+  local gap, maxn = L.entries - L.bcount, math.floor((L.bstride - L.entries) / 48)
+  local want = (last_n > 0 and gap >= 4 and gap <= 0x800) and math.min(maxn, last_n + 2) or 0
+  local h = peek(block + L.bcount, want > 0 and gap + 48 * want or 4)   -- (count and the first entries in one read)
   local n = h and pu32(h, 0)
-  if not n or n > math.floor((L.bstride - L.entries) / 48) then return nil end
+  if not n or n > maxn then return nil end
+  last_n = n
   local count = 0
   if n > 0 then
-    local e = peek(block + L.entries, 48 * n)   -- (all entries in one read)
+    local e, eo = h, gap
+    if n > want then e, eo = peek(block + L.entries, 48 * n), 0 end   -- (all entries in one read)
     if not e then return nil end
     for i = 0, n - 1 do
       -- entry: +0 status id, +8 build-up (before it takes hold) / fire: time left, gas: concentration (after),
       -- +12 its clock, +16 ends at (in that clock), +20 taken hold
-      local o = 48 * i
+      local o = eo + 48 * i
       local id = pu32(e, o)
-      if TESTER or HANDLED[id] then
+      if ALL_STATUSES or HANDLED[id] then
         count = count + 1
         local x = entry_pool[count]
         if not x then x = {}; entry_pool[count] = x end
-        x.at, x.id, x.v, x.t, x.ends, x.on = block + L.entries + o, id, pf32(e, o + 8), pf32(e, o + 12), pf32(e, o + 16), pu32(e, o + 20) ~= 0
+        x.at, x.id, x.v, x.t, x.ends, x.on = block + L.entries + o - eo, id, pf32(e, o + 8), pf32(e, o + 12), pf32(e, o + 16), pu32(e, o + 20) ~= 0
         entries_out[count] = x
       end
     end
@@ -695,7 +787,20 @@ local function write_f32(at, x)
   if S.stats.write_failures <= 5 then event(string.format('write failed at +%X', at % 4096)) end
   return false
 end
-
+-- ((0.5.1 review) a status entry is written by its place in the list, read at the start of the frame, so the id
+-- there is read again right before each write: an entry that moved in between is never written)
+local function write_entry(x, off, v)
+  local b = peek(x.at, 4)
+  if not b or pu32(b, 0) ~= x.id then return false end
+  return write_f32(x.at + off, v)
+end
+-- ((0.5.1 review) the status id checks (see ID_HOLD): off = the elements whose ids failed, ok = the ids that passed)
+local IDS = { off = {}, ok = {} }
+local function ids_moved(kind, id, why)
+  if IDS.off[kind] then return end
+  IDS.off[kind] = true
+  event(string.format('status ids moved: id %d is not %s (%s); %s status changes off', id, STATUS_NAMES[id] or '?', why, kind))
+end
 
 -- one tracker per status id: follows its entry from build-up to the end. (Entries move in the list when another
 -- one ends, so a tracker follows the status id, not the address; it is dropped when the status is gone.)
@@ -708,11 +813,15 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
   if k and k.phase == 'blocked' then k = nil end   -- (a stumbling effect that was blocked: start a full tracker)
   if not k then
     -- (a new build-up counts from zero, so its first rise counts as contact)
-    k = { last = x.on and x.v or 0, top = x.v, since = now, phase = nil, kept = false, rate = 1 }
+    k = { last = x.on and x.v or 0, top = x.v, since = now, phase = nil, kept = false, rate = 1, pre = late and x.on }
     track[x.id] = k
   end
-  k.at = x.at
-  k.seen = now
+  local check = ID_HOLD[x.id] and not IDS.ok[x.id]
+  if check and not x.on and k.phase == 'buildup' and x.v > k.last + 0.0005 and x.v > ID_HOLD[x.id] * 1.5 then
+    -- (a build-up still rising well above the line without taking hold: another status)
+    ids_moved(kind, x.id, string.format('build-up %.2f without taking hold', x.v))
+    return
+  end
   if not x.on then
     -- building up: takes hold after a flat time in it; the build-up fades once it stops rising
     k.phase = 'buildup'
@@ -722,6 +831,7 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
       if rise > 0.0005 then
         k.since = now
         k.rises = (k.rises or 0) + 1
+        if rise > (k.maxrise or 0) then k.maxrise = rise end
         if slow and hold then
           -- gas: its own rise, slowed; kept just under the line until the slowed build-up gets there (the game adds
           -- one more rise before it checks)
@@ -737,7 +847,7 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
         if hold then k.contact = want / hold * catch_time end
         k.scaled = want
       end
-      if want and math.abs(want - x.v) > 0.0005 and write_f32(x.at + 8, want) then x.v = want; k.kept = true end
+      if want and math.abs(want - x.v) > 0.0005 and write_entry(x, 8, want) then x.v = want; k.kept = true end
       if x.v > (k.peak or 0) then k.peak = x.v end
       -- (counted once a real build-up has faded away without taking hold)
       if k.kept and rise <= 0.0005 and (k.peak or 0) > 0.2 * (hold or 1) and x.v <= 0.001 and not k.counted then
@@ -750,13 +860,21 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
     return
   end
   if k.phase ~= 'on' then
+    if check and k.phase == 'buildup' and (k.rises or 0) >= 3 and (k.maxrise or 1) <= 0.2 * ID_HOLD[x.id] then
+      -- (a slow, steady build-up takes hold within about two rises of the line)
+      if k.last < 0.5 * ID_HOLD[x.id] then
+        ids_moved(kind, x.id, string.format('took hold at a build-up of %.2f', k.last))
+        return
+      end
+      IDS.ok[x.id] = true
+    end
     if k.phase == 'buildup' and not hold and k.last > 0.05 and k.last < 100 and (k.rises or 0) >= 3 then
       HOLD[x.id] = k.last   -- (learned only from a build-up seen rising over several frames)
       event(string.format('%s takes hold at a build-up of %.2f (learned)', STATUS_NAMES[x.id] or x.id, k.last))
     end
-    k.phase, k.last, k.top, k.since, k.clock, k.full = 'on', x.v, x.v, now, x.t, 0
-    st.caught = st.caught + 1
-    if TESTER then event(string.format('%s took hold (%s)%s', kind, STATUS_NAMES[x.id] or x.id, k.kept and ' after the mod held it back' or ' (not held back)')) end
+    k.phase, k.last, k.top, k.since, k.clock, k.full_c = 'on', x.v, x.v, now, x.t, 0
+    if not k.pre then st.caught = st.caught + 1 end
+    if TESTER and not k.pre then event(string.format('%s took hold (%s)%s', kind, STATUS_NAMES[x.id] or x.id, k.kept and ' after the mod held it back' or ' (not held back)')) end
   end
   -- its clock: fire runs in real time, gas statuses can run faster (Gas ran ~10x in tests)
   if dt > 0 and x.t > k.clock then k.rate = k.rate * 0.7 + 0.3 * math.max(0.2, math.min(30, (x.t - k.clock) / dt)) end
@@ -766,12 +884,16 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
   -- you have been back in it: +8 jumped up)
   if k.cut and x.v > k.last + 0.05 then k.cut, k.top = false, x.v end
   if x.v > k.top then k.top = x.v end
-  if x.v > k.last + 0.005 or x.v >= k.top - 0.08 then k.since = now; if left > k.full then k.full = left end end
+  -- ((0.5.1 review) the full length is kept in the status's own clock and turned into seconds when it is cut, once
+  -- OUT_GRACE has let the clock rate settle: it used to be kept in seconds from the take-hold frame on, before the
+  -- rate was known (gas: 10x too long, so gas was never cut))
+  if x.v > k.last + 0.005 or x.v >= k.top - 0.08 then k.since = now; if x.ends - x.t > k.full_c then k.full_c = x.ends - x.t end end
   k.last = x.v
   if opt_tail and mult < 1 and not k.cut and now - k.since >= OUT_GRACE then
-    local tail = math.max(MIN_TAIL, nice(math.floor(k.full * 2 + 0.5) / 2 * mult))   -- (full: 3 s fire, 5 s stumbling)
-    if left > tail + 0.02 and write_f32(x.at + 16, x.t + tail * k.rate) then
-      if kind == 'fire' then write_f32(x.at + 8, tail) end
+    local full = k.full_c / k.rate
+    local tail = math.max(MIN_TAIL, nice(math.floor(full * 2 + 0.5) / 2 * mult))   -- (full: 3 s fire, 5 s stumbling)
+    if left > tail + 0.02 and write_entry(x, 16, x.t + tail * k.rate) then
+      if kind == 'fire' then write_entry(x, 8, tail) end
       st.cut = st.cut + 1
       st.saved = st.saved + (left - tail)
       if TESTER then event(string.format('%s: out of it, %s cut from %.2f s to %.2f s left', kind, STATUS_NAMES[x.id] or x.id, left, tail)) end
@@ -781,7 +903,7 @@ local function shape(kind, x, mult, now, dt, opt_catch, opt_tail, catch_time, sl
   end
 end
 
---@tester-begin
+--@research-begin
 -- tester research: every status entry as it changes, at most 10 lines a second
 local research = { last = {}, next_t = 0 }
 -- tester research: the whole 48-byte entry of every new status (and of a restarted one: its clock went back), read
@@ -835,7 +957,7 @@ local function arc_research()
   end
   for i in pairs(arc_seen) do if not now_seen[i] then arc_seen[i] = nil; event(string.format('  arc %d gone (frame %d)', i, S.frame)) end end
 end
---@tester-end
+--@research-end
 
 -- Grounded: with Electrical Conduit, an arc that reaches your helldiver goes no further. Each arc in flight is a record
 -- in the arc manager (0x118 bytes at +0x130 + i * 0x118, active flags at +0x30). Its +0x40 is the entity it jumped
@@ -847,9 +969,13 @@ end
 -- Only Electrical Conduit grounds you: it is found by what it is, the passive with its own arc modifier at
 -- 95% or more (game value 0.05; Adreno-Defibrillator's is 0.5), not by its id.
 local CONDUIT_MAX = 0.1
-local GROUND = { from = 0x40, hit1 = 0x44, hit2 = 0x48, jumps = 0x2C, chaining = 0x31, scale = 0xF0 }
+-- ((0.5.1 review) the record is only written when it looks like an arc: an id at +0xEC and a scale a real arc can
+-- have (scale_min..scale_max); the first record that doesn't turns Grounded off (the game's arc records changed) and
+-- says so in the log)
+local GROUND = { from = 0x40, hit1 = 0x44, hit2 = 0x48, jumps = 0x2C, chaining = 0x31, scale = 0xF0, scale_min = 0.05, scale_max = 20 }
 local grounded_done = {}   -- arc index -> the record's id (+0xEC) already stopped
 local arc_flags = ffi.new('uint8_t[256]')
+local arc_words = ffi.cast('uint32_t *', arc_flags)   -- ((0.5.1 review) 32-bit words: plain numbers, no boxed values)
 local function ground_arcs()
   local unit = me.unit
   if not unit or unit == 0 then return end
@@ -857,10 +983,12 @@ local function ground_arcs()
   local fb = m and peek(m + 0x30, 256)
   if not fb then return end
   ffi.copy(arc_flags, fb, 256)   -- (the shared read buffer is reused for each arc below)
-  local words = ffi.cast('uint64_t *', arc_flags)
-  for w = 0, 31 do
-    if words[w] ~= 0 then   -- (8 arcs at a time: most are not in flight)
-      for i = w * 8, w * 8 + 7 do
+  -- ((0.5.1 review) a slot no longer in flight forgets the arc it stopped, so a new arc there with the same id is
+  -- stopped too)
+  for i in pairs(grounded_done) do if arc_flags[i] == 0 then grounded_done[i] = nil end end
+  for w = 0, 63 do
+    if arc_words[w] ~= 0 then   -- (4 arcs at a time: most are not in flight)
+      for i = w * 4, w * 4 + 3 do
         if arc_flags[i] ~= 0 then
           local at = m + 0x130 + i * 0x118
           local r = peek(at, 0xF4)   -- (one read: the arc's ends and jumps, its id +0xEC and scale +0xF0)
@@ -869,7 +997,13 @@ local function ground_arcs()
             local hit = hit1 == unit or pu32(r, GROUND.hit2) == unit
             local stop = (hit and r[GROUND.chaining] ~= 0)
               or (pu32(r, GROUND.from) == unit and pu32(r, GROUND.jumps) >= 1 and hit1 == 0)
-            if stop and grounded_done[i] ~= id and pf32(r, GROUND.scale) ~= 0 then
+            local scale = stop and grounded_done[i] ~= id and pf32(r, GROUND.scale)
+            if scale and scale ~= 0 then
+              if id == 0 or not (scale > GROUND.scale_min and scale < GROUND.scale_max) then
+                S.ground_off = true
+                event(string.format('grounded: off (arc %d does not look like an arc: id %d, scale %g; the game\'s arc records changed)', i, id, scale))
+                return
+              end
               if write_f32(at + GROUND.scale, 0) then
                 grounded_done[i] = id
                 S.stats.arc.grounded = S.stats.arc.grounded + 1
@@ -883,7 +1017,7 @@ local function ground_arcs()
   end
 end
 
---@tester-begin
+--@research-begin
 -- tester research (catching other players' damage): the game's queue of damage events (a manager inside the game
 -- world: [game+0x3326340] + 0x1024220 + 0x1266078; entries of 0x70 bytes at +0x1120, count at +0x201120; worked
 -- through 16 a frame by 0x12A6EF0). Every entry seen is logged as words, to learn whether a hit is queued before or
@@ -949,54 +1083,130 @@ local function research_log(now, list)
   end
   for id in pairs(research.last) do if not seen[id] then research.last[id] = nil; event('  ' .. (STATUS_NAMES[id] or id) .. ' gone') end end
 end
---@tester-end
+--@research-end
 
 -- an arc stun: cut once per stun (a new hit restarts its clock) to its length x the arc multiplier. Its +8 counts
 -- down alongside the clock, so it is lowered by the same amount and ends where the game's own stun ends.
+-- ((0.5.1 review) like the other statuses: the length is what is left in the stun's own clock when it is first seen
+-- (a new stun used +16 alone, which assumed its clock starts at 0), and its clock rate is followed. The cut is a share
+-- of the length, so it is the same in any clock; the rate only turns the 0.02 s floor and the logged seconds into
+-- the stun's clock. Until a second frame has measured it the rate is taken as 1: the stun's own +8 counts down 1:1
+-- with its clock and it lasted 1.5 s in tests.)
 local stun_track = {}
-shorten_stun = function(x, mult, now)
+shorten_stun = function(x, mult, dt)
   if not mult or mult >= 1 then return end
   local k = stun_track[x.id]
-  if not k or x.t < k.t - 0.01 then k = { t = x.t, full = x.ends, e = x.ends }; stun_track[x.id] = k end
+  if not k or x.t < k.t - 0.01 then
+    k = { t = x.t, full = x.ends - x.t, e = x.ends, rate = 1, late = late }; stun_track[x.id] = k
+  elseif dt > 0 and x.t > k.t then
+    k.rate = k.rate * 0.7 + 0.3 * math.max(0.2, math.min(30, (x.t - k.t) / dt))
+  end
   if x.ends > k.e + 0.05 then k.done, k.full = false, x.ends - x.t end     -- (another hit made it longer)
   k.t, k.e = x.t, x.ends
   if k.done or not x.on then return end
-  local tail = math.max(0.02, k.full * mult)
+  if not IDS.ok[x.id] then   -- (the status id check: Stun Small lasts about 1.5 s)
+    local len = k.full / k.rate
+    if len < STUN_LEN[1] or len > STUN_LEN[2] then
+      if k.late then k.done = true; return end   -- ((0.6.0 review) first seen part-run: can't be measured, left alone)
+      ids_moved('arc', x.id, string.format('stun of %.2f s', len))
+      return
+    end
+    IDS.ok[x.id] = true
+  end
+  local tail = math.max(0.02 * k.rate, k.full * mult)
   local cut = x.ends - (x.t + tail)
-  if x.ends - x.t > tail + 0.02 and write_f32(x.at + 16, x.t + tail) then
-    if x.v > cut then write_f32(x.at + 8, x.v - cut) end
+  if x.ends - x.t > tail + 0.02 * k.rate and write_entry(x, 16, x.t + tail) then
+    if x.v > cut then write_entry(x, 8, x.v - cut) end
     k.done = true
     local st = S.stats.arc
-    st.stun, st.stun_saved = st.stun + 1, st.stun_saved + cut
-    if TESTER then event(string.format('arc: %s cut from %.2f s to %.3f s', STATUS_NAMES[x.id] or x.id, x.ends - x.t, tail)) end
+    st.stun, st.stun_saved = st.stun + 1, st.stun_saved + cut / k.rate
+    if TESTER then event(string.format('arc: %s cut from %.2f s to %.3f s', STATUS_NAMES[x.id] or x.id, (x.ends - x.t) / k.rate, tail / k.rate)) end
   end
+end
+
+-- EMS (Stun Medium): see EMS_IDS. Followed per status id: k.e = its end last frame, k.since = when it was last put
+-- on again (its end moved forward), k.full = its length then. Blocked (Electrical Conduit): its end set to now and
+-- its +8 to 0 every frame it is on (as No Gas Slow does). Otherwise, once it has not been put on again for
+-- OUT_GRACE, what is left is cut so it ends k.full x mult after it was last put on (never below 0.02 s), and its +8
+-- is lowered by the same amount. It is never turned back into a build-up.
+local ems_track = {}
+local function ems(x, mult, now)
+  if not mult or mult >= 1 then return end
+  local k = ems_track[x.id]
+  local len = x.ends - x.t
+  local fresh = not k
+  if fresh then k = { e = x.ends, since = now, full = len }; ems_track[x.id] = k end
+  if not x.on then k.e = x.ends; return end
+  if not IDS.ok[x.id] then   -- (the status id check, on a stun just put on: an EMS stun lasts about 3 s)
+    if not fresh and x.ends <= k.e + 0.001 then k.e = x.ends; return end   -- (not put on just now: wait for one that is)
+    -- ((0.6.0 review) a stun first seen part-run (the mod started, came back from idle or found you again while it
+    -- ran) can't be measured: wait for the next one instead of switching the EMS changes off)
+    if fresh and (len < EMS_LEN[1] or len > EMS_LEN[2]) then k.e = x.ends; return end
+    if len < EMS_LEN[1] or len > EMS_LEN[2] then
+      ids_moved('ems', x.id, string.format('stun of %.2f s', len))
+      return
+    end
+    IDS.ok[x.id] = true
+  end
+  local st = S.stats.arc
+  if mult <= EMS_IMMUNE then
+    if len > 0.001 and write_entry(x, 16, x.t) then
+      write_entry(x, 8, 0)
+      if not k.counted then
+        k.counted = true
+        st.ems_blocked = st.ems_blocked + 1
+        if TESTER then event(string.format('arc: EMS (%s) blocked', STATUS_NAMES[x.id] or x.id)) end
+      end
+    end
+    k.e = x.t
+    return
+  end
+  if x.ends > k.e + 0.001 then   -- (put on again: still in the EMS, or hit again)
+    k.since, k.full, k.cut = now, len, false
+  elseif not k.cut and now - k.since >= OUT_GRACE then
+    local keep = math.max(0.02, k.full * mult - (k.full - len))
+    if len > keep + 0.02 and write_entry(x, 16, x.t + keep) then
+      local cut = len - keep
+      if x.v > 0 then write_entry(x, 8, math.max(0, x.v - cut)) end
+      k.cut = true
+      st.ems_cut, st.ems_saved = st.ems_cut + 1, st.ems_saved + cut
+      if TESTER then event(string.format('arc: out of the EMS, %s cut from %.2f s to %.2f s left', STATUS_NAMES[x.id] or x.id, len, keep)) end
+      k.e = x.t + keep
+      return
+    end
+    if len <= keep + 0.02 then k.cut = true end   -- ((0.6.0 review) nothing to cut; a failed write is tried again next frame)
+  end
+  k.e = x.ends
 end
 
 local OPTS = { fire = { 'opt_ign', 'opt_ext' }, gas = { 'opt_gas', 'opt_gas' }, arc = { 'opt_arc', 'opt_arc' } }
 local present = {}   -- (reused every frame)
 local function handle(now, dt)
+  late = now - last_handled > 0.5
+  last_handled = now
   local list = status_entries(me.owner)
   if not list then return end
-  --@tester-begin
+  --@research-begin
   if TESTER then research_log(now, list) end
-  --@tester-end
+  --@research-end
   for id in pairs(present) do present[id] = nil end
   for _, x in ipairs(list) do
     present[x.id] = true
     local kind = KIND_OF[x.id]
     if ARC_STUN_IDS[x.id] then
-      if S.opt_arc then shorten_stun(x, me.mult.arc, now) end
-    elseif kind then
+      if S.opt_arc and not IDS.off.arc then shorten_stun(x, me.mult.arc, dt) end
+    elseif EMS_IDS[x.id] then
+      if S.opt_arc and not IDS.off.ems then ems(x, me.mult.arc, now) end
+    elseif kind and not IDS.off[kind] then
       local mult = me.mult[kind]
       if CONFUSION_IDS[x.id] and S.opt_slow and mult <= NO_CONFUSION + 0.001 then
         -- strong filtration: the gas's stumbling/slowing never takes hold
         local k = track[x.id]
         if not k then k = { phase = 'blocked' }; track[x.id] = k end
-        k.at, k.seen = x.at, now
         local blocked = false
         if x.on then
-          if x.ends > x.t + 0.001 then write_f32(x.at + 16, x.t); write_f32(x.at + 8, 0); blocked = true end
-        elseif x.v > 0 then write_f32(x.at + 8, 0); blocked = true end
+          if x.ends > x.t + 0.001 and write_entry(x, 16, x.t) then write_entry(x, 8, 0); blocked = true end
+        elseif x.v > 0 and write_entry(x, 8, 0) then blocked = true end
         if blocked and not k.counted then k.counted = true; S.stats.gas.stumble = S.stats.gas.stumble + 1 end
       else
         shape(kind, x, mult, now, dt, S[OPTS[kind][1]], S[OPTS[kind][2]], me.catch[kind], me.slow[kind])
@@ -1004,6 +1214,7 @@ local function handle(now, dt)
     end
   end
   for id in pairs(stun_track) do if not present[id] then stun_track[id] = nil end end
+  for id in pairs(ems_track) do if not present[id] then ems_track[id] = nil end end
   for id, k in pairs(track) do
     if not present[id] then
       local kind = KIND_OF[id]
@@ -1029,12 +1240,18 @@ local function u64_bytes(v) return u32_bytes(v % 4294967296) .. u32_bytes(math.f
 -- What the mod changed is also kept in a process environment variable (with game.dll's address), so a mod that
 -- is redeployed or reloaded with the game open puts the game's values back first instead of taking the boosted
 -- value for the game's own and boosting it again. The game's values are also put back when the loader shuts down.
+-- ((0.5.1 review) it also keeps KNOWN (each boosted passive's game value and boosted value) for the session, and is
+-- put back before the game layout is looked up, so a reload that can't find the layout still puts the values back:
+-- it only needs memory access and game.dll's address.)
 local KEEP_VAR = 'REALISTIC_RESISTANCES_KEEP'
 local function save_kept()
   if not api.env_set then return end
   local out = {}
   for addr, b in pairs(BOOSTED) do out[#out + 1] = string.format('b %.0f %.17g %.17g', addr, b.orig, b.new) end
   for pp, g in pairs(GRAFTED) do out[#out + 1] = string.format('g %.0f %.0f %d %.0f %d', pp, g.orig_list, g.orig_n, g.list, g.n) end
+  for pid, t in pairs(KNOWN) do
+    for stat, k in pairs(t) do out[#out + 1] = string.format('p %d %d %.17g %.17g', pid, stat, k.orig, k.new) end
+  end
   if #out == 0 then api.env_set(KEEP_VAR, nil) return end
   api.env_set(KEEP_VAR, string.format('%.0f;', api.base() or 0) .. table.concat(out, ';'))
 end
@@ -1048,7 +1265,10 @@ local function restore_kept()
     for item in rest:gmatch('[^;]+') do
       local f = {}
       for w in item:gmatch('%S+') do f[#f + 1] = w end
-      if f[1] == 'b' and #f == 4 then
+      if f[1] == 'p' and #f == 5 then
+        local pid, stat, orig, new = tonumber(f[2]), tonumber(f[3]), tonumber(f[4]), tonumber(f[5])
+        if pid and stat and orig and new then KNOWN[pid] = KNOWN[pid] or {}; KNOWN[pid][stat] = { orig = orig, new = new } end
+      elseif f[1] == 'b' and #f == 4 then
         local addr, orig, new = tonumber(f[2]), tonumber(f[3]), tonumber(f[4])
         local r = api.read(addr, 4)
         if r and f32_at(r, 0) == new and write_f32(addr, orig) then n = n + 1 end
@@ -1062,6 +1282,7 @@ local function restore_kept()
     if n > 0 then event(string.format('arc damage boost from an earlier load put back (%d value(s))', n)) end
   end
   api.env_set(KEEP_VAR, nil)
+  save_kept()   -- (what is still known: the passives' values)
 end
 
 -- all-elements passives (no arc modifier of their own): the game looks up the passive's arc modifier, then
@@ -1134,12 +1355,12 @@ end
 
 local function boost_arc(ps)
   local changed = graft_arc(ps)
-  local want = {}
+  local want, pids = {}, {}
   if S.opt_arc then
     for _, x in ipairs(ps or {}) do
       local addr, v = x.at[ARC_STAT], x.stats[ARC_STAT]
       -- (not on all-elements passives: they have no arc modifier of their own)
-      if addr and v and v > 0 and v < 1 and not x.stats[ALL_STAT] then want[addr] = v end
+      if addr and v and v > 0 and v < 1 and not x.stats[ALL_STAT] then want[addr], pids[addr] = v, x.id end
     end
   end
   for addr, b in pairs(BOOSTED) do
@@ -1156,13 +1377,17 @@ local function boost_arc(ps)
   end
   for addr, orig in pairs(want) do
     local b = BOOSTED[addr]
+    local r = api.read(addr, 4)
+    local cur = r and f32_at(r, 0)
     if not b then
       b = { orig = orig, new = tonumber(ffi.new('float', orig / ARC_BOOST)) }
       BOOSTED[addr], changed = b, true
-      event(string.format('arc damage boost: passive lets through %.1f%% of arc damage (was %.1f%%)', b.new * 100, orig * 100))
+      local pid = pids[addr]
+      KNOWN[pid] = KNOWN[pid] or {}
+      KNOWN[pid][ARC_STAT] = { orig = b.orig, new = b.new }
+      event(string.format('arc damage boost: passive lets through %.1f%% of arc damage (was %.1f%%)%s', b.new * 100, orig * 100,
+        cur == b.new and ' (already boosted: the passive\'s known value)' or ''))
     end
-    local r = api.read(addr, 4)
-    local cur = r and f32_at(r, 0)
     if cur ~= b.new then
       if cur == b.orig then write_f32(addr, b.new)
       else BOOSTED[addr], changed = nil, true end   -- (the game put something else there: leave it, look again next time)
@@ -1187,16 +1412,17 @@ end
 local function locate()
   local p, why = find_player()
   if not p then
-    me.owner, me.unit, me.conduit, track, stun_track = nil, nil, false, {}, {}
+    me.owner, me.unit, me.conduit, track, stun_track, ems_track = nil, nil, false, {}, {}, {}
+    last_handled = -1
     S.armor = why
     boost_arc(nil)
     return
   end
-  if p.owner ~= me.owner then track, stun_track = {}, {} end
+  if p.owner ~= me.owner then track, stun_track, ems_track = {}, {}, {}; last_handled = -1 end
   me.owner, me.unit = p.owner, p.unit
-  --@tester-begin
+  --@research-begin
   me.avatar = p.avatar
-  --@tester-end
+  --@research-end
   -- (your owner id first; the link map's redirect only when that finds nothing)
   local via = 'owner'
   local ps, g, idx = passive_of(p.owner)
@@ -1235,12 +1461,12 @@ local function locate()
   if text ~= S.armor then
     S.armor = text
     event('helldiver: ' .. text)
-    --@tester-begin
+    --@research-begin
     if TESTER then
       event(string.format('  avatar %d owner %d unit %d; passive map: %s', p.avatar, p.owner, p.unit or -1, passive_map_dump()))
       pcall(passive_layout_dump)
     end
-    --@tester-end
+    --@research-end
   end
 end
 
@@ -1268,7 +1494,7 @@ local MENU = {
     description = 'Filtration Buffer: gas-resistant armor holds out against gas longer, by the passive gas resistance (50%: twice as long in medium armor) and the gas wears off sooner. No Gas Slow: with 80% gas resistance or more (Advanced Filtration) the gas stumbling and slowing never takes hold.' },
   { key = 'arc', label = 'Arc Resistance', flags = { 'RealisticResistancesArc', 'RealisticResistancesGrounded' },
     choices = { 'Resistance and Grounded', 'Only Resistance', 'Only Grounded' },
-    description = 'Resistance: arc-resistant armor holds out against the electric effect, it wears off sooner, and arc-resistant passives take a quarter of the arc damage they did. Grounded (Electrical Conduit only): arcs end at you instead of chaining on to others.' },
+    description = 'Resistance: arc-resistant armor holds out against the electric effect and EMS stuns (Electrical Conduit is never stunned by EMS), they wear off sooner, and arc-resistant passives take a quarter of the arc damage they did. Grounded (Electrical Conduit only): arcs end at you instead of chaining on to others.' },
 }
 -- pick: 0 = Off, 1 = both, 2 = only the first part, 3 = only the second
 local PICK_FLAGS = { [0] = { false, false }, [1] = { true, true }, [2] = { true, false }, [3] = { false, true } }
@@ -1281,6 +1507,8 @@ local function menu_apply(m, value)
   if not f then return end
   rawset(_G, m.flags[1], f[1]); rawset(_G, m.flags[2], f[2])
 end
+-- ((0.6.0 review) closures made outside menu_step/tick, so LuaJIT can compile those)
+local function menu_hook(m) return function(value) pcall(menu_apply, m, value) end end
 local menu_at, menu_done = 0, false
 local function menu_step(frame)
   if menu_done or frame < menu_at then return end
@@ -1301,7 +1529,7 @@ local function menu_step(frame)
       added = added + 1
       local okg, v = pcall(M.get, id)
       if okg and v ~= nil then menu_apply(m, v) end
-      pcall(M.on_change, id, function(value) pcall(menu_apply, m, value) end)
+      pcall(M.on_change, id, menu_hook(m))
     else
       failed_id = id .. ': ' .. tostring(ok and why or done)
     end
@@ -1312,8 +1540,53 @@ end
 
 local grounded_noted = false
 local next_locate, next_flush, ready, failed, last_t = 0, 0, false, false, nil
+-- ((0.5.1 review) puts the game's values back (for a newer copy of the mod taking over); true once nothing of the
+-- mod's is left in the game)
+S.restore = function()
+  if ready then boost_arc(nil) end
+  return next(BOOSTED) == nil and next(GRAFTED) == nil
+end
+-- ((0.5.1 review) taking over from PREV (see the top): true once this copy can run. PREV hands over by itself when it
+-- still runs; one whose frame count stopped for 30 frames no longer runs, and its values are put back for it.)
+local takeover = { frame = nil, still = 0, waited = 0, kept_done = false }
+local function take_over()
+  if not PREV.handed_over then
+    local f = PREV.frame
+    if f ~= takeover.frame then takeover.frame, takeover.still = f, 0 else takeover.still = takeover.still + 1 end
+    takeover.waited = takeover.waited + 1
+    if takeover.still < 30 then
+      if takeover.waited == 600 then
+        S.status = 'off: an earlier copy of the mod is still running'
+        event(S.status .. ' (it keeps the mod; this copy starts if it stops)')
+      end
+      return false
+    end
+    local how = 'its values are put back from the kept record'   -- (a copy without restore: 0.5.0)
+    if type(PREV.restore) == 'function' then
+      local okr, done = pcall(PREV.restore)
+      how = (okr and done) and 'its values put back' or 'what it could not put back is left to the kept record'
+    end
+    PREV.handed_over, PREV.retired = true, true
+    event('the copy loaded before no longer runs: ' .. how)
+  else
+    event('took over from the copy loaded before (it put the game\'s values back)')
+  end
+  PREV = nil
+  S.status = 'starting'
+  return true
+end
+local function on(x) return x and 'on' or 'off' end
 local function tick()
   S.frame = S.frame + 1
+  if S.superseded then
+    -- ((0.5.1 review) a newer copy was loaded: put the game's values back for it, then stop)
+    if not S.handed_over and S.restore() then
+      event('a newer copy of the mod was loaded: the game\'s values put back, handing over')
+      S.handed_over, S.retired = true, true
+    end
+    return
+  end
+  if PREV and not take_over() then return end
   if S.frame < 60 then return end
   menu_step(S.frame)
   if failed then return end
@@ -1330,19 +1603,19 @@ local function tick()
     + (S.opt_arc and 16 or 0) + (S.opt_ground and 32 or 0)
   if mask ~= S.last_mask then   -- (the text only when an option changed)
     if S.last_mask then
-      local function on(x) return x and 'on' or 'off' end
       event(string.format('options changed: harder to ignite %s, self-extinguish %s, gas resistance %s, no gas slow %s, arc resistance %s, grounded %s',
         on(S.opt_ign), on(S.opt_ext), on(S.opt_gas), on(S.opt_slow), on(S.opt_arc), on(S.opt_ground)))
     end
     S.last_mask = mask
   end
   if not ready then
+    -- ((0.5.1 review) the values an earlier load left in the game go back first, even if the layout isn't found)
+    if not takeover.kept_done and api.base() then takeover.kept_done = true; pcall(restore_kept) end
     local fine, okv, how = pcall(resolve_layout)
     if fine and okv then
       ready = true
       S.status = 'active'
       event('started; game layout: ' .. how)
-      pcall(restore_kept)
       if TESTER then event(L.arcmgr and string.format('arc manager at game.dll+%X', L.arcmgr - api.base()) or 'arc manager not found') end
     else
       local why = fine and tostring(how) or tostring(okv)
@@ -1358,12 +1631,30 @@ local function tick()
     grounded_noted = true
     if not L.arcmgr then event('grounded: off (the game\'s arc code was not found)') end
   end
-  if now >= next_locate then next_locate = now + LOCATE_EVERY; locate() end
-  if me.owner then handle(now, dt) end
-  if L.arcmgr and S.opt_ground and me.conduit then ground_arcs() end
-  --@tester-begin
+  if now >= next_locate then next_locate = now + ((me.idle and me.owner) and LOCATE_IDLE or LOCATE_EVERY); locate() end
+  -- nothing to do unless you wear armor whose resistance an option that is on works with: then only the armor check
+  -- runs (every 2 s; 4x a second while no helldiver is found, so a new one is picked up at once), no statuses are
+  -- read and nothing is written
+  local m = me.mult
+  local busy = me.owner and ((m.fire < 1 and (S.opt_ign or S.opt_ext)) or (m.gas < 1 and (S.opt_gas or S.opt_slow))
+    or (m.arc < 1 and (S.opt_arc or (S.opt_ground and me.conduit)))) or false
+  if busy == me.idle or me.idle == nil then
+    me.idle = not busy
+    if me.idle then
+      track, stun_track, ems_track = {}, {}, {}
+      last_handled = -1
+      for id in pairs(present) do present[id] = nil end
+      next_locate = math.min(next_locate, now + LOCATE_IDLE)
+    else next_locate = math.min(next_locate, now + LOCATE_EVERY) end
+    if TESTER and me.owner then event(me.idle and 'idle: no armor the mod works on (or its options are off)' or 'active: armor the mod works on') end
+  end
+  if busy then handle(now, dt) end
+  if L.arcmgr and S.opt_ground and me.conduit and not S.ground_off then ground_arcs() end
+  --@research-begin
   if TESTER and L.arcmgr then arc_research() end
   if TESTER then pcall(damage_queue_research) end
+  --@research-end
+  --@tester-begin
   if TESTER and api.key_down then
     local down = api.key_down(0x77)   -- F8
     if down and not S.f8 then
@@ -1380,7 +1671,7 @@ local function tick()
     local st, sig = S.stats, nil
     sig = string.format('%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d', st.writes, st.write_failures, st.fire.caught, st.fire.kept,
       st.fire.cut, st.gas.caught, st.gas.kept, st.gas.cut, st.gas.stumble, st.arc.caught, st.arc.kept, st.arc.cut,
-      st.arc.stun, st.arc.grounded, S.errors and #S.errors or 0)
+      st.arc.stun, st.arc.grounded, (S.errors and #S.errors or 0) + (S.errors_more or 0)) .. ' ' .. st.arc.ems_blocked .. ' ' .. st.arc.ems_cut
     if sig ~= S.last_sig then S.last_sig = sig; S.dirty = true end
   end
 end
@@ -1389,18 +1680,14 @@ local original = rawget(_G, 'update')
 if type(original) == 'function' then
   rawset(_G, 'update', function(...)
     local fine, e = pcall(tick)
-    if not fine then
-      local first = not (S.errors and S.errors[tostring(e)])
-      log_error(e)
-      if first then write_log() end
-    end
+    if not fine and log_error(e) then write_log() end
     return original(...)
   end)
   -- the loader shutting down (game closing, mods redeployed): the game's own arc values go back
   local previous = rawget(_G, 'shutdown')
   rawset(_G, 'shutdown', function(...)
     pcall(function()
-      if ready then boost_arc(nil); event('shut down: the game\'s own values put back'); write_log() end
+      if ready and not S.retired then boost_arc(nil); event('shut down: the game\'s own values put back'); write_log() end
     end)
     if type(previous) == 'function' then return previous(...) end
   end)
