@@ -2,9 +2,9 @@
 
 ![Realistic Resistances](media/gallery.png)
 
-*Elemental resistances: fire, gas and arc. Beta (0.5).*
+*Elemental resistances: fire, gas and arc, plus EMS. Beta (0.6).*
 
-**Download:** `Realistic-Resistances-0.5.0.zip` from the [latest release](https://github.com/Th3chef/Realistic-Resistances/releases/latest) (not the source code). Needs [Bingus Shared Loader](https://www.nexusmods.com/helldivers2/mods/16292).
+**Download:** `Realistic-Resistances-0.6.0.zip` from the [latest release](https://github.com/Th3chef/Realistic-Resistances/releases/latest) (not the source code). Needs [Bingus Shared Loader](https://www.nexusmods.com/helldivers2/mods/16292).
 
 In the base game, an armor passive's fire, gas or arc resistance only cuts the damage. You still catch fire the moment a flame touches you, you still stumble out of every gas cloud, and an arc still stuns you for the full time. Real protective gear doesn't work like that. With this mod, the passive's own resistance also works against the **effect**, scaled by how heavy your armor is.
 
@@ -41,15 +41,16 @@ Vanilla                      1x                                         5 s
 ## Arc
 
 - **Resistance**: arc-resistant passives take a quarter of the arc damage they did (Electrical Conduit 95% becomes 98.75%), and the arc stun is cut to match the passive's resistance. The electric effect also holds off and wears off sooner.
+- **EMS** (part of Resistance): Electrical Conduit is never stunned by EMS. Other arc-resistant armor is stunned as normal inside an EMS field, but recovers sooner once you're out, by the passive's resistance (50%: 1.5 s instead of 3 s). The stamina drain inside an EMS field is unchanged.
 - **Grounded** (Electrical Conduit only): arcs end at you instead of chaining on to your teammates.
 
 ```
-Passive                          Arc damage resistance   Arc stun
-Electrical Conduit 95%           98.75%                  0.075 s
-Adreno-Defibrillator 50%         87.5%                   0.75 s
-Acclimated 50%                   87.5%                   0.75 s
-Desert Stormer 40%               85%                     0.9 s
-Vanilla stun                                             1.5 s
+Passive                    Arc damage resistance   Arc stun   EMS stun after the field
+Electrical Conduit 95%     98.75%                  0.075 s    never stunned by EMS
+Adreno-Defibrillator 50%   87.5%                   0.75 s     1.5 s
+Acclimated 50%             87.5%                   0.75 s     1.5 s
+Desert Stormer 40%         85%                     0.9 s      1.8 s
+Vanilla                                            1.5 s      3 s
 ```
 
 ## Options
@@ -88,11 +89,13 @@ Disable it in your mod manager, then Purge and Deploy.
 - Mods that change the same status effects or armor passive values may clash.
 - Patch-proof by design: it finds what it needs in the game's code at start-up, so a game hotfix doesn't break it. If it can't find something after a patch it turns itself off and says why in its log, rather than guessing. Grounded is optional: if only its part isn't found, everything else still works.
 - It only changes the game's data (status effect timers and passive values), never the game's code.
+- Light on performance: while you wear no armor it works on (or its options for that armor are off), it does nothing but check your armor every 2 seconds.
 
 ## Known limitations
 
 - **Beta**: everything listed here has been tested, but not every armor, weapon and enemy combination. Please report anything odd.
-- The game doesn't say what caused a stun, so while you wear arc resistance every small stun is shortened, not just the ones from arcs.
+- The game doesn't say what caused a stun, so while you wear arc resistance every small stun is shortened, not just the ones from arcs (and every EMS-type stun is changed, not just EMS fields'). The stun grenade and explosion knockdowns use other stuns and are unchanged.
+- An EMS field still drains your stamina, so you can't sprint inside one, even in Electrical Conduit.
 - Other players' Tesla Towers and arc weapons deal normal damage and chain as normal (see Multiplayer).
 - Gas times depend on the cloud: a thicker cloud builds up faster, so it takes hold sooner. Fire catch times are flat.
 
