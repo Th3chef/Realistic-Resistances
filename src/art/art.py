@@ -1,14 +1,14 @@
 """Renders Realistic Resistances' art with Chromium (Playwright), in the same family as the other mods: Anton +
-Barlow Condensed, yellow on black with a hazard stripe. Three element cards (fire, gas, arc) carry the mod's real
+Barlow Condensed, yellow on black (no hazard-stripe bands: Don's rule since 0.6.0). Three element cards (fire, gas, arc) carry the mod's real
 numbers. Everything is drawn here (no game assets, logos or emblems).
 Outputs (this folder): thumbnail_1254.png, thumbnail_512.png (mod manager), header_1300x372.png,
-gallery_1920x1080.png, values_1920x1080.png, GitHub-Social-1280x640.png, options/*.png (option icons)."""
+gallery_1920x1080.png, values_1920x1080.png, GitHub-Social-1280x640.png, AyakaMods-Cover-1600x1000.png, options/*.png (option icons)."""
 import base64, os
 from PIL import Image
 from playwright.sync_api import sync_playwright
 
 ART = os.path.dirname(os.path.abspath(__file__))
-BADGE = '0.5 BETA'
+BADGE = '0.6 BETA'
 YELLOW = '#ffe710'
 FIRE, GAS, ARC = '#ff7a1a', '#9be23c', '#5ad8ff'
 
@@ -70,7 +70,7 @@ ICONS = {'fire': (flame, FIRE), 'gas': (cloud, GAS), 'arc': (bolt, ARC)}
 CARDS = [  # kind, big number, line 1, line 2 (the mod's real values)
     ('fire', '2s', 'TO CATCH FIRE', 'INFLAMMABLE &middot; MEDIUM ARMOR'),
     ('gas', '5&times;', 'SLOWER GAS', 'ADV. FILTRATION &middot; MEDIUM ARMOR'),
-    ('arc', '4&times;', 'ARC RESISTANCE', 'CONDUIT 95% &rarr; 98.75%'),
+    ('arc', '4&times;', 'ARC RESISTANCE', 'CONDUIT 98.75% &middot; NO EMS STUN'),
 ]
 
 
@@ -97,8 +97,6 @@ def page(w, h, L):
                     radial-gradient(ellipse at {L['glow3']}, rgba(155,226,60,0.10), rgba(0,0,0,0) 40%),
                     repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px {28*u:.0f}px),
                     repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px {28*u:.0f}px); }}
-      .stripe {{ position:absolute; left:0; right:0; bottom:0; height:{L['stripe']}px;
-        background: repeating-linear-gradient(-45deg, {YELLOW} 0 {18*u:.0f}px, #111 {18*u:.0f}px {36*u:.0f}px); }}
       .badge {{ position:absolute; {L['badge']}; background:{YELLOW}; color:#0e0e10; font:{L['badge_size']}px Anton;
         padding:0 {L['badge_size']*0.28:.0f}px; line-height:1.25; letter-spacing:0.02em; }}
       .tag {{ position:absolute; {L['tag']}; text-align:right; font-family:Barlow; font-weight:700; letter-spacing:0.04em; line-height:1.05; }}
@@ -120,12 +118,12 @@ def page(w, h, L):
       .card .l2 {{ font-family:Barlow; font-weight:500; color:#a9a9a9; font-size:{L['l2']}px; letter-spacing:0.02em; white-space:nowrap; margin-top:{L['pad']*0.25:.0f}px; }}
       .card.c {{ border-top-width:{5*u:.0f}px; border-top-color:rgba(255,231,16,0.8); padding:{L['pad']}px; justify-content:center; }}
       .card.c .lbl {{ font-family:Anton; font-size:{L['l1']}px; margin-top:{L['pad']*0.4:.0f}px; letter-spacing:0.06em; }}
-    </style></head><body><div class="bg"></div><div class="stripe"></div>
+    </style></head><body><div class="bg"></div>
       <div class="cards">{cards_html(u, compact)}</div>
       <div class="badge">{BADGE}</div>
       {'' if not L.get('tag') else '<div class="tag"><div class="a">ARMOR THAT</div><div class="b">ACTUALLY RESISTS</div></div>'}
       <div class="title"><div class="a">REALISTIC</div><div class="b">RESISTANCES</div></div>
-      <div class="foot">{L.get('foot_text', 'FIRE &nbsp;&bull;&nbsp; GAS &nbsp;&bull;&nbsp; ARC &nbsp;&nbsp;|&nbsp;&nbsp; BUILT ON YOUR ARMOR PASSIVE')}</div>
+      <div class="foot">{L.get('foot_text', 'FIRE &nbsp;&bull;&nbsp; GAS &nbsp;&bull;&nbsp; ARC &nbsp;&bull;&nbsp; EMS &nbsp;&nbsp;|&nbsp;&nbsp; BUILT ON YOUR ARMOR PASSIVE')}</div>
     </body></html>'''
 
 
@@ -142,11 +140,15 @@ LAYOUTS = {
         badge='left:40px; top:40px', badge_size=52, tag='right:40px; top:40px', tag_size=28,
         cards='left:560px; right:40px; top:130px; height:320px', gap=18, pad=20, icon=110, big=72, l1=21, l2=14,
         title='left:38px; top:330px', t1=110, t2=110, foot='left:42px; bottom:36px', foot_size=22)),
+    'AyakaMods-Cover-1600x1000.png': (1600, 1000, dict(u=1.35, glow1='48% 40%', glow2='88% 40%', glow3='68% 38%', stripe=0,
+        badge='left:52px; top:50px', badge_size=72, tag='right:56px; top:54px', tag_size=38,
+        cards='left:640px; right:56px; top:170px; height:400px', gap=24, pad=24, icon=140, big=96, l1=29, l2=17,
+        title='left:50px; top:600px', t1=140, t2=140, foot='left:56px; bottom:44px', foot_size=28)),
     'header_1300x372.png': (1300, 372, dict(u=0.8, glow1='62% 50%', glow2='92% 50%', glow3='77% 50%', stripe=10,
         badge='left:40px; top:30px', badge_size=36, tag=None, tag_size=1, compact=True,
         cards='left:680px; right:40px; top:40px; height:270px', gap=16, pad=14, icon=120, big=1, l1=34, l2=1,
         title='left:38px; top:96px', t1=96, t2=96, foot='left:42px; bottom:26px', foot_size=20,
-        foot_text='FIRE &nbsp;&bull;&nbsp; GAS &nbsp;&bull;&nbsp; ARC')),
+        foot_text='FIRE &nbsp;&bull;&nbsp; GAS &nbsp;&bull;&nbsp; ARC &nbsp;&bull;&nbsp; EMS')),
 }
 
 
@@ -167,16 +169,15 @@ def values_page():
                 [['Adv. Filtration 80%', '3.75 / 5 / 6.25&times;', 'never'], ['Acclimated 50%', '1.5 / 2 / 2.5&times;', '2.5 s'],
                  ['Desert Stormer 40%', '1.25 / 1.67 / 2.08&times;', '3 s'], ['Hazmat, Padding 25%', '1 / 1.33 / 1.67&times;', '3.75 s']],
                 'Vanilla stumbling: 5 s. A full-strength hit (strike blast, grenade at your feet) stays vanilla.')
-    arc = table('arc', 'ARC', ['PASSIVE', 'DAMAGE RES.', 'ARC STUN'],
-                [['Electrical Conduit 95%', '98.75%', '0.075 s'], ['Adreno-Defib. 50%', '87.5%', '0.75 s'], ['Acclimated 50%', '87.5%', '0.75 s'],
-                 ['Desert Stormer 40%', '85%', '0.9 s']],
-                'Vanilla stun: 1.5 s. Electrical Conduit also grounds arcs: they end at you instead of chaining on.')
+    arc = table('arc', 'ARC', ['PASSIVE', 'DAMAGE', 'STUN', 'EMS AFTER'],
+                [['Elec. Conduit 95%', '98.75%', '0.075 s', 'never'], ['Adreno-Defib. 50%', '87.5%', '0.75 s', '1.5 s'], ['Acclimated 50%', '87.5%', '0.75 s', '1.5 s'],
+                 ['Desert Stormer 40%', '85%', '0.9 s', '1.8 s']],
+                'Vanilla: arc stun 1.5 s, EMS 3 s after the field. Conduit is never stunned by EMS and grounds arcs.')
     return f'''<!doctype html><html><head><meta charset="utf-8"><style>{FONTS}
       html,body {{ margin:0; width:{w}px; height:{h}px; overflow:hidden; background:#08090b; }}
       .bg {{ position:absolute; inset:0; background:
           repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 45px),
           repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 45px); }}
-      .stripe {{ position:absolute; left:0; right:0; bottom:0; height:18px; background: repeating-linear-gradient(-45deg, {YELLOW} 0 29px, #111 29px 58px); }}
       .head {{ position:absolute; left:64px; top:46px; font-family:Anton; font-size:84px; color:#fff; letter-spacing:0.02em; }}
       .head span {{ color:{YELLOW}; }}
       .sub {{ position:absolute; left:68px; top:150px; font-family:Barlow; font-weight:600; font-size:30px; color:#cfcfcf; letter-spacing:0.05em; }}
@@ -192,7 +193,7 @@ def values_page():
       td:first-child {{ color:#e8e8e8; font-weight:500; font-size:26px; white-space:nowrap; }}
       td:not(:first-child) {{ color:var(--c); white-space:nowrap; }}
       .n {{ margin-top:auto; font-family:Barlow; font-weight:500; font-size:26px; color:#b5b5b5; line-height:1.25; letter-spacing:0.02em; }}
-    </style></head><body><div class="bg"></div><div class="stripe"></div>
+    </style></head><body><div class="bg"></div>
       <div class="head">REALISTIC <span>RESISTANCES</span></div>
       <div class="sub">YOUR ARMOR PASSIVE'S RESISTANCE NOW ALSO RESISTS THE EFFECT &nbsp;&bull;&nbsp; TIMES: LIGHT / MEDIUM / HEAVY ARMOR</div>
       <div class="grid">{fire}{gas}{arc}</div></body></html>'''
